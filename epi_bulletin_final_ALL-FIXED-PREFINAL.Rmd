@@ -1,0 +1,936 @@
+---
+title: "Epidemiology and Disease Surveillance Unit — Ministry of Health, Zambia"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    fig_caption: true
+  officedown::rdocx_document:
+    reference_docx: null
+    tables:
+      style: Table Grid
+      layout: autofit
+      width: 1.0
+    plots:
+      style: Normal
+      align: center
+params:
+  week_number:  34
+  week_start:   "19th August 2024"
+  week_end:     "25th August 2024"
+  year:         2024
+  run_python:   true
+---
+
+```{r setup, include=FALSE}
+# ═════════════════════════════════════════════════════════════════════════════
+# SETUP
+# ═════════════════════════════════════════════════════════════════════════════
+knitr::opts_chunk$set(
+  echo      = FALSE,
+  message   = FALSE,
+  warning   = FALSE,
+  dpi       = 150,
+  fig.align = "center",
+  out.width = "100%"
+)
+
+# ── Packages ──────────────────────────────────────────────────────────────────
+required_packages <- c(
+  "tidyverse", "readxl", "knitr", "flextable",
+  "officer", "officedown", "scales", "here", "sf", "patchwork"
+)
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE))
+    install.packages(pkg, repos = "https://cloud.r-project.org", quiet = TRUE)
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+root_dir    <- here::here()
+data_dir    <- file.path(root_dir, "data")
+figures_dir <- file.path(root_dir, "outputs")
+
+# ──  summary table PNG only ───────────────────────────────────────────
+# All charts and the choropleth map are rendered natively in R (see functions
+# below). Python is only called to produce summary_table.png.
+if (params$run_python) {
+  py_script <- file.path(root_dir, "scripts", "generate_plots.py")
+  if (file.exists(py_script))
+    system2("python3", py_script, stdout = FALSE, stderr = FALSE)
+}
+
+# ── Load surveillance CSVs ────────────────────────────────────────────────────
+weekly  <- read_csv(file.path(data_dir, "weekly_data_by_province.csv"),
+                    show_col_types = FALSE)
+msl     <- read_csv(file.path(data_dir, "measles_lab.csv"),
+                    show_col_types = FALSE)
+
+# ── Derived summaries ─────────────────────────────────────────────────────────
+wk34 <- weekly %>% filter(week == params$week_number, year == params$year)
+
+# Helper: "Province(N), ..." string from rows where col > 0
+prov_bullet <- function(df, col) {
+  df %>%
+    filter(.data[[col]] > 0) %>%
+    arrange(province) %>%
+    mutate(lbl = paste0(province, "(", .data[[col]], ")")) %>%
+    pull(lbl) %>% paste(collapse = ", ")
+}
+
+afp_prov     <- prov_bullet(wk34, "afp_suspected")
+anthrax_prov <- prov_bullet(wk34, "anthrax_suspected")
+cholera_prov <- prov_bullet(wk34, "cholera_suspected")
+measles_prov <- prov_bullet(wk34, "measles_suspected")
+malaria_prov <- prov_bullet(wk34, "malaria_suspected")
+diarr_prov   <- prov_bullet(wk34, "non_bloody_diarrhoea_suspected")
+typhoid_prov <- prov_bullet(wk34, "typhoid_suspected")
+
+afp_tot     <- sum(wk34$afp_suspected)
+anthrax_tot <- sum(wk34$anthrax_suspected)
+cholera_tot <- sum(wk34$cholera_suspected)
+measles_tot <- sum(wk34$measles_suspected)
+malaria_tot <- sum(wk34$malaria_suspected)
+diarr_tot   <- sum(wk34$non_bloody_diarrhoea_suspected)
+typhoid_tot <- sum(wk34$typhoid_suspected)
+
+ml_suspected <- sum(msl$total_suspected)
+ml_tested    <- sum(msl$specimens_tested)
+ml_positive  <- sum(msl$positive)
+ml_pr        <- round(ml_positive / ml_tested * 100, 1)
+
+fmt <- function(x) scales::comma(x)
+
+# ── Priority disease summary table ────────────────────────────────────────────
+summary_data <- tibble(
+  `Disease/Event/Condition` = c(
+    "AFP", "Anthrax", "Cholera", "Non-bloody Diarrhoea",
+    "Malaria", "Measles", "Monkeypox", "Plague", "Typhoid Fever"),
+  Sus34  = c(6,    8,     4,      35175,   144640, 28, 0,  0,  33),
+  Tes34  = c(4,    2,     0,       2435,   138717, 21, 0,  0,  20),
+  Con34  = c(1,    1,     0,       2171,    40329,  3, 0,  0,   4),
+  SusCum = c(318,  283, 16684,   813029, 8011914, 4360, 8, 13, 822),
+  TesCum = c(259,   36,  4410,    46953, 7570205, 1343, 4,  1, 499),
+  ConCum = c(1,     5,   2034,    50502, 3693242,  655, 0,  0,  45)
+) %>% mutate(across(where(is.numeric), fmt))
+
+# ── Maternal deaths summary stats ─────────────────────────────────────────────
+# Defined here in setup so mat_wk_n and mat_cum are available to the
+# maternal-panel chunk (which runs before maternal-bullets).
+raw_mat_setup <- read_csv(
+  file.path(data_dir, "maternal_deaths.csv"),
+  col_names = FALSE, show_col_types = FALSE
+)
+prov_rows_setup <- raw_mat_setup %>%
+  set_names(c("province", "deaths_cum", "week34_col")) %>%
+  filter(province != "province", province != "cause") %>%
+  mutate(deaths_cum = as.integer(deaths_cum))
+
+mat_cum  <- sum(prov_rows_setup$deaths_cum)
+mat_wk_n <- 15   # total weekly maternal deaths (from bulletin)
+```
+
+```{r fn-measles-lab, include=FALSE}
+# ═════════════════════════════════════════════════════════════════════════════
+# FUNCTION: plot_measles_lab()
+#
+# Produces the "Measles Laboratory Test Results by Province" stacked bar chart.
+#
+# Data:    data/measles_lab.csv
+#          Columns: province, positive, negative, indeterminate, pending,
+#                   not_done, total_suspected, specimens_tested
+#
+# Steps:
+#   1. Read measles_lab.csv
+#   2. Select the five result columns and pivot wide → long (one row per
+#      province × result category)
+#   3. Apply ordered factors so the x-axis follows PROVINCE_ORDER and the
+#      stack follows RESULT_ORDER (bottom → top)
+#   4. geom_col with position_stack draws filled stacked bars
+#   5. scale_fill_manual maps each result category to its exact hex colour
+#   6. theme_classic + custom tweaks replicates the bulletin style
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── Colour palette ────────────────────────────────────────────────────────────
+RESULT_COLOURS <- c(
+  "Indeterminate" = "#4a7c59",   # muted green
+  "Negative"      = "#457b9d",   # steel blue
+  "Not done"      = "#adb5bd",   # light grey
+  "Pending"       = "#6d2b9e",   # purple
+  "Positive"      = "#e63946"    # red
+)
+
+# Stack order bottom → top; also controls legend order
+RESULT_ORDER <- c("Indeterminate", "Negative", "Not done", "Pending", "Positive")
+
+# X-axis province sequence
+PROVINCE_ORDER <- c(
+  "Central", "Copperbelt", "Eastern", "Luapula", "Lusaka",
+  "Muchinga", "North-Western", "Northern", "Southern", "Western"
+)
+
+plot_measles_lab <- function(
+    df        = NULL,                                    # optional pre-loaded df
+    save_path = here("outputs", "measles_lab_bar.png"), # NULL → no file saved
+    width_in  = 7.5,
+    height_in = 3.8,
+    dpi       = 150
+) {
+
+  # Step 1 — load data
+  if (is.null(df))
+    df <- read_csv(here("data", "measles_lab.csv"), show_col_types = FALSE)
+
+  # Step 2 — pivot wide → long
+  df_long <- df %>%
+    select(province, positive, negative, indeterminate, pending, not_done) %>%
+    rename(
+      Positive      = positive,
+      Negative      = negative,
+      Indeterminate = indeterminate,
+      Pending       = pending,
+      `Not done`    = not_done
+    ) %>%
+    pivot_longer(
+      cols      = -province,
+      names_to  = "result",
+      values_to = "count"
+    ) %>%
+    mutate(
+      province = factor(province, levels = PROVINCE_ORDER),
+      result   = factor(result,   levels = RESULT_ORDER)
+    )
+
+  # Step 3 — build ggplot
+  p <- ggplot(df_long, aes(x = province, y = count, fill = result)) +
+
+    # Stacked bars with white segment gaps
+    geom_col(
+      position  = position_stack(reverse = FALSE),
+      width     = 0.6,
+      colour    = "white",
+      linewidth = 0.3
+    ) +
+
+    # Exact bulletin colours per result category
+    scale_fill_manual(
+      values = RESULT_COLOURS,
+      breaks = RESULT_ORDER,
+      name   = "Result"
+    ) +
+
+    # Uppercase province labels on x axis
+    scale_x_discrete(labels = function(x) str_to_upper(x)) +
+
+    # Y axis: integer breaks, no gap below 0
+    scale_y_continuous(
+      expand = expansion(mult = c(0, 0.05)),
+      breaks = scales::breaks_pretty(n = 5)
+    ) +
+
+    labs(x = NULL, y = "Number of specimens") +
+
+    theme_classic(base_size = 10, base_family = "sans") +
+    theme(
+      axis.text.x          = element_text(angle = 45, hjust = 1,
+                                           size = 7.5, colour = "#333333"),
+      axis.text.y          = element_text(size = 8,   colour = "#555555"),
+      axis.title.y         = element_text(size = 9,   colour = "#444444"),
+      axis.line.x          = element_line(colour = "#cccccc"),
+      axis.line.y          = element_line(colour = "#cccccc"),
+      axis.ticks           = element_line(colour = "#cccccc"),
+      legend.title         = element_text(size = 8, face = "bold"),
+      legend.text          = element_text(size = 8),
+      legend.key.size      = unit(0.4, "cm"),
+      legend.position      = "right",
+      legend.justification = "top",
+      panel.grid           = element_blank(),
+      panel.background     = element_rect(fill = "white", colour = NA),
+      plot.background      = element_rect(fill = "white", colour = NA),
+      plot.margin          = margin(4, 6, 4, 4, unit = "pt")
+    )
+
+  # Step 4 — save
+  if (!is.null(save_path)) {
+    dir.create(dirname(save_path), showWarnings = FALSE, recursive = TRUE)
+    ggsave(save_path, plot = p, width = width_in, height = height_in,
+           dpi = dpi, bg = "white")
+    return(invisible(p))
+  }
+
+  return(p)
+}
+```
+
+```{r fn-maternal-causes, include=FALSE}
+# ═════════════════════════════════════════════════════════════════════════════
+# FUNCTION: plot_maternal_causes()
+#
+# Produces the "Causes of maternal death (Week 34, n=15)" horizontal bar chart.
+#
+# Data:    data/maternal_deaths.csv
+#          The CSV holds two logical tables in one file:
+#            Rows 1–10  → province cumulative deaths
+#            Row  11    → embedded header: "cause, deaths_week34, percent"
+#            Rows 12–16 → five cause rows
+#          Parsing: read with col_names = FALSE, locate the embedded "cause"
+#          header row by value, slice the rows below it.
+#
+# Steps:
+#   1. Read raw CSV without header inference
+#   2. Find the row where column 1 == "cause" (the embedded header)
+#   3. Slice rows below it, assign names, cast to integer
+#   4. Apply rev(CAUSE_ORDER) as factor levels so the longest bar sits at the
+#      top (ggplot draws y-axis factors bottom → top, so rev() is required)
+#   5. geom_col draws horizontal bars; geom_text adds % labels to the right
+#   6. scale_x_continuous with 25 % right expansion prevents label clipping
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Teal bar colour matching the bulletin
+MAT_BAR_COLOUR <- "#2a9d8f"
+
+# Desired display order: longest bar at top → shortest at bottom
+CAUSE_ORDER <- c(
+  "Obstetric haemorrhage",
+  "Non-obstetric complications",
+  "Unanticipated complications",
+  "Hypertensive disorder",
+  "Pregnancy-related infection"
+)
+
+plot_maternal_causes <- function(
+    df        = NULL,                                       # optional pre-loaded df
+    save_path = here("outputs", "maternal_causes_bar.png"), # NULL → no file saved
+    width_in  = 5.2,
+    height_in = 3.2,
+    dpi       = 150
+) {
+
+  # Step 1-3 — load and parse data
+  if (is.null(df)) {
+    raw <- read_csv(
+      here("data", "maternal_deaths.csv"),
+      col_names      = FALSE,
+      show_col_types = FALSE
+    )
+
+    # Row where the first column equals the literal string "cause"
+    header_row <- which(raw[[1]] == "cause")
+
+    df <- raw[(header_row + 1):nrow(raw), 1:3] %>%
+      set_names(c("cause", "deaths_week34", "percent")) %>%
+      mutate(
+        deaths_week34 = as.integer(deaths_week34),
+        percent       = as.integer(percent)
+      )
+  }
+
+  # Step 4 — ordered factor: rev() places longest bar at the top
+  df <- df %>%
+    mutate(cause = factor(cause, levels = rev(CAUSE_ORDER)))
+
+  # Step 5 — build ggplot
+  p <- ggplot(df, aes(x = deaths_week34, y = cause)) +
+
+    # Horizontal filled bars
+    geom_col(
+      fill      = MAT_BAR_COLOUR,
+      width     = 0.55,
+      colour    = "white",
+      linewidth = 0.3
+    ) +
+
+    # Percentage labels just to the right of each bar
+    geom_text(
+      aes(label = paste0(percent, "%")),
+      hjust  = -0.15,
+      vjust  = 0.5,
+      size   = 3.2,
+      colour = "#333333"
+    ) +
+
+    # Step 6 — 25 % right padding keeps labels inside the plot area
+    scale_x_continuous(
+      expand = expansion(mult = c(0, 0.25)),
+      breaks = scales::breaks_pretty(n = 4)
+    ) +
+
+    labs(x = "# of maternal deaths", y = NULL) +
+
+    theme_classic(base_size = 10, base_family = "sans") +
+    theme(
+      axis.text.x      = element_text(size = 8,   colour = "#555555"),
+      axis.text.y      = element_text(size = 8.5, colour = "#333333",
+                                      hjust = 1),
+      axis.title.x     = element_text(size = 9,   colour = "#444444"),
+      axis.line.x      = element_line(colour = "#cccccc"),
+      axis.line.y      = element_line(colour = "#cccccc"),
+      axis.ticks       = element_line(colour = "#cccccc"),
+      panel.grid       = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA),
+      plot.background  = element_rect(fill = "white", colour = NA),
+      plot.margin      = margin(4, 10, 4, 4, unit = "pt")
+    )
+
+  # Save
+  if (!is.null(save_path)) {
+    dir.create(dirname(save_path), showWarnings = FALSE, recursive = TRUE)
+    ggsave(save_path, plot = p, width = width_in, height = height_in,
+           dpi = dpi, bg = "white")
+    return(invisible(p))
+  }
+  return(p)
+}
+```
+
+```{r fn-maternal-map, include=FALSE}
+# ═════════════════════════════════════════════════════════════════════════════
+# FUNCTION: plot_maternal_map()
+#
+# Produces the "Cumulative distribution of maternal deaths (2024) by province"
+# choropleth map.
+#
+# Data:    data/maternal_deaths.csv  (province rows — same file as above)
+#          Zambia_-_Administrative_District_Boundaries_2022.shp
+#          (116 districts, EPSG:3857)
+#
+# Three-layer rendering strategy (replicates the sample bulletin exactly):
+#   Layer 1 — Province fills   : BuPu choropleth. Districts are dissolved to
+#                                 province polygons via st_union(); each
+#                                 province is filled by its deaths count.
+#   Layer 2 — District borders : thin #aaaaaa lines drawn over the fills,
+#                                 making internal district sub-divisions
+#                                 visible within each province.
+#   Layer 3 — Province borders : thick #444444 lines redrawn on top, giving
+#                                 each province a clearly defined outer edge.
+#
+# Label connectors:
+#   - st_centroid() computes the geographic centre of each province polygon.
+#   - geom_segment() draws a line from centroid to a manually calibrated
+#     label position (LABEL_POS) that matches the sample bulletin layout.
+#   - geom_label() places "Province(N)" text with a white background box.
+#
+# Shapefiles searched in order:
+#   1. /mnt/user-data/uploads/Zambia_-_Administrative_District_Boundaries_2022.shp
+#   2. data/Zambia_-_Administrative_District_Boundaries_2022.shp
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Shapefile search paths
+DIST_SHP_PATHS <- c(
+  here("data","shape files","Zambia_-_Administrative_District_Boundaries_2022.shp"),
+  here("data","shape files", "Zambia_-_Administrative_District_Boundaries_2022.shp")
+)
+
+# BuPu palette matches the sample bulletin
+MAP_PALETTE <- "BuPu"
+
+# Label positions calibrated to the sample bulletin (WGS84 decimal degrees).
+# Province centroids are computed from the shapefile; label anchors are placed
+# outside the province to avoid overlap, with connector lines joining them.
+#   Centroids for reference:
+#     Central(28.24,-14.41)  Copperbelt(27.85,-13.12)  Eastern(31.90,-13.58)
+#     Luapula(29.21,-10.67)  Lusaka(29.08,-15.43)       Muchinga(31.97,-11.33)
+#     North-Western(25.05,-13.03)  Northern(30.65,-9.72)
+#     Southern(26.76,-16.79)       Western(23.68,-15.64)
+LABEL_POS <- tribble(
+  ~province,         ~lx,    ~ly,
+  "Northern",        32.9,   -8.85,
+  "Luapula",         32.3,  -10.15,
+  "Muchinga",        33.6,  -11.15,
+  "Eastern",         33.65, -13.70,
+  "Central",         29.5,  -14.05,
+  "Copperbelt",      28.2,  -14.20,
+  "Lusaka",          31.0,  -15.85,
+  "North-Western",   22.3,  -12.20,
+  "Western",         21.7,  -15.60,
+  "Southern",        27.1,  -17.85
+)
+
+plot_maternal_map <- function(
+    deaths_df = NULL,                                        # optional pre-loaded df
+    save_path = here("outputs", "maternal_deaths_map.png"), # NULL → no file saved
+    width_in  = 6.2,
+    height_in = 5.8,
+    dpi       = 180
+) {
+
+  # Step 1 — load and parse province deaths data
+  if (is.null(deaths_df)) {
+    raw <- read_csv(
+      here("data", "maternal_deaths.csv"),
+      col_names      = FALSE,
+      show_col_types = FALSE
+    )
+    # Skip both embedded headers; keep only the 10 province data rows
+    deaths_df <- raw %>%
+      set_names(c("province", "maternal_deaths_cumulative", "week34")) %>%
+      filter(
+        province != "province",  # skip the first header row stored as data
+        province != "cause"      # skip the embedded second-table header
+      ) %>%
+      select(province, maternal_deaths = maternal_deaths_cumulative) %>%
+      mutate(maternal_deaths = as.integer(maternal_deaths))
+  }
+
+  # Step 2 — load district shapefile, reproject to WGS84
+  shp_path <- NULL
+  for (p in DIST_SHP_PATHS) {
+    if (file.exists(p)) { shp_path <- p; break }
+  }
+  if (is.null(shp_path))
+    stop("Shapefile 'Zambia_-_Administrative_District_Boundaries_2022.shp' ",
+         "not found in /mnt/user-data/uploads/ or data/")
+
+  districts <- st_read(shp_path, quiet = TRUE) %>%
+    st_transform(4326)
+
+  # Dissolve 116 district polygons → 10 province polygons
+  provinces <- districts %>%
+    group_by(PROVINCE) %>%
+    summarise(geometry = st_union(geometry), .groups = "drop") %>%
+    rename(province = PROVINCE) %>%
+    left_join(deaths_df, by = "province")   # attach deaths counts
+
+  # Step 3 — compute province centroids for connector-line origins
+  centroids <- provinces %>%
+    st_centroid() %>%
+    mutate(
+      cx = st_coordinates(geometry)[, 1],
+      cy = st_coordinates(geometry)[, 2]
+    ) %>%
+    st_drop_geometry() %>%
+    select(province, cx, cy)
+
+  labels <- LABEL_POS %>%
+    left_join(centroids, by = "province") %>%
+    left_join(deaths_df, by = "province")
+
+  # Step 4 — build ggplot (three layers + labels)
+  p <- ggplot() +
+
+    # Layer 1: province choropleth fill (no borders yet)
+    geom_sf(
+      data   = provinces,
+      aes(fill = maternal_deaths),
+      colour = NA
+    ) +
+
+    # BuPu continuous scale, range 18–65, ticks at 20 / 40 / 60
+    scale_fill_distiller(
+      palette   = MAP_PALETTE,
+      direction = 1,
+      limits    = c(18, 65),
+      breaks    = c(20, 40, 60),
+      name      = "Cumulative\nMaternal Deaths",
+      guide     = guide_colorbar(
+        direction      = "horizontal",
+        title.position = "top",
+        barwidth       = unit(3.5, "cm"),
+        barheight      = unit(0.35, "cm"),
+        ticks          = TRUE
+      )
+    ) +
+
+    # Layer 2: thin district lines → sub-divisions visible inside provinces
+    geom_sf(data = districts, fill = NA,
+            colour = "#aaaaaa", linewidth = 0.2) +
+
+    # Layer 3: thick province borders → clearly defined outer boundaries
+    geom_sf(data = provinces, fill = NA,
+            colour = "#444444", linewidth = 0.8) +
+
+    # Connector lines: centroid → label anchor
+    geom_segment(
+      data      = labels,
+      aes(x = cx, y = cy, xend = lx, yend = ly),
+      colour    = "#444444",
+      linewidth = 0.4
+    ) +
+
+    # Dots at province centroids
+    geom_point(
+      data   = labels,
+      aes(x = cx, y = cy),
+      size   = 1.5,
+      colour = "#222222"
+    ) +
+
+    # Province labels with white background
+    geom_label(
+      data          = labels,
+      aes(x = lx, y = ly,
+          label = paste0(province, "(", maternal_deaths, ")")),
+      size          = 2.4,
+      colour        = "#111111",
+      fill          = "white",
+      label.size    = NA,
+      label.padding = unit(0.12, "lines"),
+      fontface      = "plain"
+    ) +
+
+    theme_void(base_family = "sans") +
+    theme(
+      legend.position      = c(0.18, 0.97),
+      legend.justification = c(0.5, 1),
+      legend.title         = element_text(size = 6.5, colour = "#333333"),
+      legend.text          = element_text(size = 6,   colour = "#333333"),
+      plot.background      = element_rect(fill = "white", colour = NA),
+      plot.margin          = margin(2, 2, 2, 2, unit = "pt")
+    ) +
+
+    coord_sf(expand = FALSE)
+
+  # Save
+  if (!is.null(save_path)) {
+    dir.create(dirname(save_path), showWarnings = FALSE, recursive = TRUE)
+    ggsave(save_path, plot = p, width = width_in, height = height_in,
+           dpi = dpi, bg = "white")
+    return(invisible(p))
+  }
+  return(p)
+}
+```
+
+```{r fn-headlines, include=FALSE}
+# ═════════════════════════════════════════════════════════════════════════════
+# HEADLINE BANNER FUNCTIONS
+#
+# Three functions, one per banner style in the sample bulletin.
+# Colour codes are used directly — no intermediate constants.
+#
+#  banner_main()    — background "#2d6a4f" (dark green),  centred white bold
+#                     Used for: main title, "Summary of VPD...", "Maternal Deaths"
+#
+#  banner_section() — background "#52b788" (medium green), left-aligned white bold
+#                     Used for: "Summary", "Summary Report Priority Diseases..."
+#
+#  banner_sub()     — background "#e07b39" (orange),      centred white bold
+#                     Used for: "Measles Laboratory Test Results by Province",
+#                               "Causes of maternal death (Week 34, n=15)",
+#                               "Cumulative distribution of maternal deaths..."
+#
+# Each function returns a ggplot object rendered as a narrow coloured strip.
+# ggplot2::annotate("rect") fills the panel with the hex colour.
+# ggplot2::annotate("text") places bold white text over it.
+# theme_void() removes all axes, gridlines, and backgrounds.
+# ═════════════════════════════════════════════════════════════════════════════
+
+#' Dark-green banner (#2d6a4f) — main title and major section headings
+#' @param label  text string to display
+#' @param size   font size in ggplot units (default 4.2 ≈ 12 pt)
+banner_main <- function(label, size = 4.2) {
+  ggplot2::ggplot() +
+    ggplot2::annotate("rect",
+      xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf,
+      fill = "#2d6a4f"                       # dark green
+    ) +
+    ggplot2::annotate("text",
+      x = 0.5, y = 0.5,
+      label    = label,
+      colour   = "white",
+      fontface = "bold",
+      size     = size,
+      hjust    = 0.5,
+      vjust    = 0.5
+    ) +
+    ggplot2::scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+    ggplot2::scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      plot.margin     = ggplot2::margin(0, 0, 0, 0),
+      plot.background = ggplot2::element_rect(fill = "#2d6a4f", colour = NA)
+    )
+}
+
+#' Medium-green banner (#52b788) — sub-section headings, left-aligned
+#' @param label  text string to display
+#' @param size   font size in ggplot units (default 3.8 ≈ 11 pt)
+banner_section <- function(label, size = 3.8) {
+  ggplot2::ggplot() +
+    ggplot2::annotate("rect",
+      xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf,
+      fill = "#52b788"                       # medium green
+    ) +
+    ggplot2::annotate("text",
+      x = 0.01, y = 0.5,
+      label    = label,
+      colour   = "white",
+      fontface = "bold",
+      size     = size,
+      hjust    = 0,                          # left-aligned
+      vjust    = 0.5
+    ) +
+    ggplot2::scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+    ggplot2::scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      plot.margin     = ggplot2::margin(0, 0, 0, 0),
+      plot.background = ggplot2::element_rect(fill = "#52b788", colour = NA)
+    )
+}
+
+#' Orange banner (#e07b39) — figure and chart headers, centred
+#' @param label  text string to display
+#' @param size   font size in ggplot units (default 3.2 ≈ 9 pt)
+banner_sub <- function(label, size = 3.2) {
+  ggplot2::ggplot() +
+    ggplot2::annotate("rect",
+      xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf,
+      fill = "#e07b39"                       # orange
+    ) +
+    ggplot2::annotate("text",
+      x = 0.5, y = 0.5,
+      label    = label,
+      colour   = "white",
+      fontface = "bold",
+      size     = size,
+      hjust    = 0.5,
+      vjust    = 0.5
+    ) +
+    ggplot2::scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+    ggplot2::scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      plot.margin     = ggplot2::margin(0, 0, 0, 0),
+      plot.background = ggplot2::element_rect(fill = "#e07b39", colour = NA)
+    )
+}
+
+#' Lime-green banner (#92D050) — section headings matching the sample bulletin:
+#' "Summary", "Summary Report Priority Diseases...",
+#' "Summary of VPD Surveillance Indicators", "Maternal Deaths"
+#' @param label  text string to display
+#' @param size   font size in ggplot units (default 4.2 ≈ 12 pt)
+banner_green <- function(label, size = 4.2) {
+  ggplot2::ggplot() +
+    ggplot2::annotate("rect",
+      xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf,
+      fill = "#92D050"                       # lime green — sample bulletin colour
+    ) +
+    ggplot2::annotate("text",
+      x = 0.5, y = 0.5,
+      label    = label,
+      colour   = "white",
+      fontface = "bold",
+      size     = size,
+      hjust    = 0.5,
+      vjust    = 0.5
+    ) +
+    ggplot2::scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+    ggplot2::scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      plot.margin     = ggplot2::margin(0, 0, 0, 0),
+      plot.background = ggplot2::element_rect(fill = "#92D050", colour = NA)
+    )
+}
+```
+
+```{r fn-side-by-side, include=FALSE}
+# ═════════════════════════════════════════════════════════════════════════════
+# FUNCTION: plot_maternal_panel()
+#
+# Places "Causes of maternal death" and "Cumulative distribution of maternal
+# deaths by province" side by side with their orange sub-banners above each,
+# exactly as in the sample bulletin.
+#
+# Strategy:
+#   Uses the patchwork package to combine four ggplot objects in a 2×2 grid:
+#     [banner_causes]  [banner_map  ]   ← row 1: orange sub-banners
+#     [p_causes      ] [p_map       ]   ← row 2: the two charts
+#
+#   patchwork::plot_layout() controls:
+#     heights = c(0.08, 1)  — banner row is ~8% of total height
+#     widths  = c(1, 1)     — equal column widths
+#
+# @param p_causes  ggplot from plot_maternal_causes()
+# @param p_map     ggplot from plot_maternal_map()
+# @param week      week number for the causes banner label
+# @param n         total deaths for the causes banner label
+# @return          a patchwork object (print() renders it)
+# ═════════════════════════════════════════════════════════════════════════════
+
+plot_maternal_panel <- function(
+    p_causes,
+    p_map,
+    week = 34,
+    n    = 15
+) {
+  # Build the two orange sub-banners dynamically
+  b_causes <- banner_sub(
+    paste0("Causes of maternal death (Week ", week, ", n=", n, ")")
+  )
+  b_map <- banner_sub(
+    "Cumulative distribution of maternal deaths (2024) by province"
+  )
+
+  # Combine: banners on top, charts below, side by side.
+  # patchwork: | = horizontal, / = vertical stack
+  combined <- (b_causes | b_map) /
+              (p_causes  | p_map) +
+    patchwork::plot_layout(
+      heights = c(0.08, 1),
+      widths  = c(1, 1)
+    )
+
+  return(combined)
+}
+```
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     BULLETIN CONTENT
+     ══════════════════════════════════════════════════════════════════════════ -->
+
+```{r title-banner, fig.height=0.45, out.width="100%"}
+# Dark-green main title banner — uses banner_main() from fn-headlines chunk
+banner_main(
+  paste0("Week ", params$week_number,
+         " Epidemiological Bulletin   ",
+         params$week_start, " – ", params$week_end),
+  size = 4.8
+)
+```
+
+---
+
+```{r summary-banner, fig.height=0.32, out.width="100%"}
+# Medium-green "Summary" section banner
+banner_green("Summary")
+```
+
+### Immediately Notifiable Diseases and Events
+
+```{r immediate-bullets, results='asis'}
+bullets <- list(
+  c("AFP",     paste0(afp_tot,     " suspected cases were reported from ", afp_prov,     " provinces.")),
+  c("Anthrax", paste0(anthrax_tot, " suspected cases were reported from ", anthrax_prov, " provinces.")),
+  c("Cholera", paste0(cholera_tot, " suspected cases were reported from ", cholera_prov, " province.")),
+  c("Measles", paste0(measles_tot, " suspected cases were reported from ", measles_prov, " provinces."))
+)
+for (b in bullets) cat("- **", b[1], "**: ", b[2], "\n", sep = "")
+```
+
+### Other Diseases and Events
+
+```{r other-bullets, results='asis'}
+bullets2 <- list(
+  c("Non-bloody Diarrhoea",
+    paste0(fmt(diarr_tot),   " suspected cases were reported from ", diarr_prov,   " provinces.")),
+  c("Malaria",
+    paste0(fmt(malaria_tot), " suspected cases were reported from ", malaria_prov, " provinces.")),
+  c("Typhoid Fever",
+    paste0(typhoid_tot,      " suspected cases were reported from ", typhoid_prov, " provinces."))
+)
+for (b in bullets2) cat("- **", b[1], "**: ", b[2], "\n", sep = "")
+```
+
+---
+
+```{r summary-report-banner, fig.height=0.32, out.width="100%"}
+# Medium-green "Summary Report" section banner
+banner_green("Summary Report Priority Diseases, Conditions and Events")
+```
+
+```{r summary-table}
+flextable(summary_data) %>%
+  set_header_labels(
+    `Disease/Event/Condition` = "Disease/Event/Condition",
+    Sus34  = "Suspected",
+    Tes34  = "Tested",
+    Con34  = "Confirmed",
+    SusCum = "Suspected",
+    TesCum = "Tested",
+    ConCum = "Confirmed"
+  ) %>%
+  add_header_row(
+    values    = c(
+      "",
+      "Week 34",
+      "Week 1 to 34, Cumulative Total"
+    ),
+    colwidths = c(1, 3, 3)
+  ) %>%
+  bg(i = 1, part = "header", bg = "#e07b39") %>%   # orange — outer header row
+  color(i = 1, part = "header", color = "white") %>%
+  bold(i = 1, part = "header") %>%
+  bg(i = 2, part = "header", bg = "#f4a261") %>%   # light orange — inner header row
+  color(i = 2, part = "header", color = "white") %>%
+  bold(i = 2, part = "header") %>%
+  bg(i = seq(1, nrow(summary_data), 2), part = "body", bg = "#f7f9f4") %>%
+  bg(i = seq(2, nrow(summary_data), 2), part = "body", bg = "white") %>%
+  align(j = 2:7, align = "center", part = "all") %>%
+  align(j = 1,   align = "left",   part = "all") %>%
+  width(j = 1, width = 2.0) %>%
+  width(j = 2:7, width = 0.82) %>%
+  fontsize(size = 9, part = "all") %>%
+  font(fontname = "Calibri", part = "all") %>%
+  border_outer(border = fp_border(color = "#aaaaaa", width = 0.5)) %>%
+  hline(border = fp_border(color = "#dddddd", width = 0.3), part = "body") %>%
+  set_table_properties(layout = "autofit", width = 1)
+```
+
+---
+
+```{r vpd-banner, fig.height=0.38, out.width="100%"}
+# Dark-green "Summary of VPD Surveillance Indicators" banner
+banner_green("Summary of VPD Surveillance Indicators")
+```
+
+```{r measles-sub-banner, fig.height=0.28, out.width="100%"}
+# Orange "Measles Laboratory Test Results by Province" sub-banner
+banner_sub("Measles Laboratory Test Results by Province")
+```
+
+```{r measles-bar, fig.width=7.5, fig.height=3.8}
+# Calls plot_measles_lab() defined in fn-measles-lab chunk above.
+# No arguments: function reads data/measles_lab.csv and returns a ggplot object.
+p_measles <- plot_measles_lab()
+print(p_measles)
+```
+
+```{r measles-bullets, results='asis'}
+cat(paste0(
+  "- The country has recorded a total of **", fmt(ml_suspected),
+  "** suspected measles cases in ", params$year, ".\n",
+  "- From the **", fmt(ml_tested), "** measles specimens that have been tested, **",
+  ml_positive, "** have been confirmed positive (PR **", ml_pr, "%**).\n"
+))
+```
+
+---
+
+```{r maternal-banner, fig.height=0.38, out.width="100%"}
+# Dark-green "Maternal Deaths" section banner
+banner_green("Maternal Deaths")
+```
+
+```{r maternal-panel, fig.width=11.5, fig.height=5.2}
+# plot_maternal_panel() — defined in fn-side-by-side chunk.
+# Combines plot_maternal_causes() and plot_maternal_map() side by side,
+# each with its own orange sub-banner above it, matching the sample bulletin.
+p_causes <- plot_maternal_causes(save_path = NULL)
+p_map    <- plot_maternal_map(save_path = NULL)
+plot_maternal_panel(p_causes, p_map,
+                    week = params$week_number,
+                    n    = mat_wk_n)
+```
+
+```{r maternal-bullets, results='asis'}
+# mat_wk_n and mat_cum are defined in the setup chunk and available here.
+cat(paste0(
+  "- The bar chart on the left summarises the causes of deaths of **",
+  mat_wk_n, "** maternal deaths recorded in week ", params$week_number, ".\n",
+  "- Hypertensive disorder, Non-obstetric complications, and Obstetric haemorrhage ",
+  "continue to be the leading causes of maternal deaths this year.\n",
+  "- Cumulatively in ", params$year, ", **", fmt(mat_cum),
+  "** maternal deaths have been recorded across the country, as depicted on the map.\n",
+  "- Provinces with darker shades (Lusaka, Copperbelt, and Southern) indicate ",
+  "those with a higher number of reported maternal deaths.\n"
+))
+```
+
+---
+
+*Report generated automatically · `r format(Sys.time(), "%d %B %Y, %H:%M")`*  
+*Surveillance data: DHIS2 / Provincial Health Offices*  
+*Shapefiles: OCHA Zambia (district boundaries 2022; ADM1 province boundaries 2020)*
